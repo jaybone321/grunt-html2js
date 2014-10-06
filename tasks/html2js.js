@@ -1,3 +1,4 @@
+
 /*
  * grunt-html2js
  * https://github.com/karlgoldstein/grunt-html2js
@@ -11,6 +12,8 @@
 module.exports = function (grunt) {
 
 	var path = require('path');
+	var minify = require('html-minifier').minify;
+	var jade = require('jade');
 	var defaultCache = '$templateCache';
 
 	var escapeContent = function (content, quoteChar, indentString) {
@@ -39,35 +42,93 @@ module.exports = function (grunt) {
 		}
 	};
 
-	// compile a template to an angular module
-	var compileTemplate = function (moduleName, filepath, quoteChar, indentString, useStrict, customProvider) {
+	function isJadeTemplate(filepath) {
+		var jadeExtension = /\.jade$/;
+		return jadeExtension.test(filepath);
+	}
 
-		var cacheProvider = customProvider && customProvider.length > 0 ? customProvider : defaultCache;
-		var content = escapeContent(grunt.file.read(filepath), quoteChar, indentString);
-		var doubleIndent = indentString + indentString;
-		var strict = (useStrict) ? indentString + quoteChar + 'use strict' + quoteChar + ';\n' : '';
+	// return template content
+	var getContent = function (filepath, options) {
+		var content = grunt.file.read(filepath);
+		if (isJadeTemplate(filepath)) {
+			options.jade.filename = filepath;
+			content = jade.render(content, options.jade);
+		}
 
-		var module = 'angular.module(' + quoteChar + moduleName +
-		  quoteChar + ', []).run([' + quoteChar + cacheProvider + quoteChar + ', function(' + cacheProvider + ') ' +
-		  '{\n' + strict + indentString + cacheProvider + '.put(' + quoteChar + moduleName + quoteChar + ',\n' + doubleIndent + quoteChar + content +
-		   quoteChar + ');\n}]);\n';
+		// Process files as templates if requested.
+		var process = options.process;
+		if (typeof process === "function") {
+			content = process(content, filepath);
+		} else if (process) {
+			if (process === true) {
+				process = {};
+			}
+			content = grunt.template.process(content, process);
+		}
 
-		return module;
+		if (Object.keys(options.htmlmin).length) {
+			try {
+				content = minify(content, options.htmlmin);
+			} catch (err) {
+				grunt.warn(filepath + '\n' + err);
+			}
+		}
+
+		// trim leading whitespace
+		content = content.replace(/(^\s*)/g, '');
+
+		return escapeContent(content, options.quoteChar, options.indentString);
 	};
 
 	// compile a template to an angular module
-	var compileCoffeeTemplate = function (moduleName, filepath, quoteChar, indentString, customProvider) {
-
-		var cacheProvider = customProvider && customProvider.length > 0 ? customProvider : defaultCache;
-		var content = escapeContent(grunt.file.read(filepath), quoteChar, indentString);
+	var compileTemplate = function (moduleName, filepath, options) {
+		var quoteChar = options.quoteChar;
+		var indentString = options.indentString;
+		var withModule = !options.singleModule;
+		var content = getContent(filepath, options);
 		var doubleIndent = indentString + indentString;
+		var strict = (options.useStrict) ? indentString + quoteChar + 'use strict' + quoteChar + ';\n' : '';
+		var compiled = '';
+		var cacheProvider = options.customProvider && options.customProvider.length > 0 ? options.customProvider : defaultCache;
 
-		var module = 'angular.module(' + quoteChar + moduleName +
-		  quoteChar + ', []).run([' + quoteChar + cacheProvider + quoteChar + ', (' + cacheProvider + ') ->\n' +
-		  indentString + cacheProvider + '.put(' + quoteChar + moduleName + quoteChar + ',\n' + doubleIndent + quoteChar + content +
-		  quoteChar + ')\n])\n';
+		if (withModule) {
+			compiled += 'angular.module(' + quoteChar + moduleName +
+			  quoteChar + ', []).run([' + quoteChar + cacheProvider + quoteChar + ', function(' + cacheProvider + ') {\n' + strict;
+		}
 
-		return module;
+		compiled += indentString + cacheProvider + '.put(' + quoteChar + moduleName + quoteChar +
+		  ',\n' + doubleIndent + quoteChar + content + quoteChar + ');';
+
+		if (withModule) {
+			compiled += '\n}]);\n';
+		}
+
+		return compiled;
+	};
+
+	// compile a template to an angular module
+	var compileCoffeeTemplate = function (moduleName, filepath, options) {
+		var quoteChar = options.quoteChar;
+		var indentString = options.indentString;
+		var withModule = !options.singleModule;
+		var content = getContent(filepath, options);
+		var doubleIndent = indentString + indentString;
+		var compiled = '';
+		var cacheProvider = options.customProvider && options.customProvider.length > 0 ? options.customProvider : defaultCache;
+
+		if (withModule) {
+			compiled += 'angular.module(' + quoteChar + moduleName +
+			  quoteChar + ', []).run([' + quoteChar + '$templateCache' + quoteChar + ', ($templateCache) ->\n';
+		}
+
+		compiled += indentString + '$templateCache.put(' + quoteChar + moduleName + quoteChar +
+		  ',\n' + doubleIndent + quoteChar + content + quoteChar + ')';
+
+		if (withModule) {
+			compiled += '\n])\n';
+		}
+
+		return compiled;
 	};
 
 	grunt.registerMultiTask('html2js', 'Compiles Angular-JS templates to JavaScript.', function () {
@@ -80,9 +141,17 @@ module.exports = function (grunt) {
 			fileFooterString: '',
 			indentString: '  ',
 			target: 'js',
-			cacheProvider: undefined
+			htmlmin: {},
+			process: false,
+			jade: { pretty: true },
+			singleModule: false,
+			customProvider: undefined
 		});
 
+		var cacheProvider = options.customProvider && options.customProvider.length > 0 ? options.customProvider : defaultCache;
+
+		var counter = 0;
+		var target = this.target;
 		// generate a separate module
 		this.files.forEach(function (f) {
 
@@ -98,21 +167,41 @@ module.exports = function (grunt) {
 				}
 				moduleNames.push("'" + moduleName + "'");
 				if (options.target === 'js') {
-					return compileTemplate(moduleName, filepath, options.quoteChar, options.indentString, options.useStrict, options.cacheProvider);
+					return compileTemplate(moduleName, filepath, options);
 				} else if (options.target === 'coffee') {
-					return compileCoffeeTemplate(moduleName, filepath, options.quoteChar, options.indentString, options.cacheProvider);
+					return compileCoffeeTemplate(moduleName, filepath, options);
 				} else {
 					grunt.fail.fatal('Unknow target "' + options.target + '" specified');
 				}
 
-			}).join('\n');
+			});
+
+			counter += modules.length;
+			modules = modules.join('\n');
 
 			var fileHeader = options.fileHeaderString !== '' ? options.fileHeaderString + '\n' : '';
 			var fileFooter = options.fileFooterString !== '' ? options.fileFooterString + '\n' : '';
 			var bundle = "";
 			var targetModule = f.module || options.module;
-			//Allow a 'no targetModule if module is null' option
-			if (targetModule) {
+			// If options.module is a function, use that to get the targetModule
+			if (grunt.util.kindOf(targetModule) === 'function') {
+				targetModule = targetModule(f, target);
+			}
+
+			if (!targetModule && options.singleModule) {
+				throw new Error("When using singleModule: true be sure to specify a (target) module");
+			}
+
+			if (options.singleModule) {
+				if (options.target === 'js') {
+					bundle = "angular.module('" + targetModule + "', []).run(['" + cacheProvider + "', function(" + cacheProvider + ") {\n";
+					modules += '\n}]);\n';
+				} else if (options.target === 'coffee') {
+					bundle = "angular.module('" + targetModule + "', []).run(['" + cacheProvider + "', (" + cacheProvider + ") ->\n";
+					modules += '\n])\n';
+				}
+			} else if (targetModule) {
+				//Allow a 'no targetModule if module is null' option
 				bundle = "angular.module('" + targetModule + "', [" + moduleNames.join(', ') + "])";
 				if (options.target === 'js') {
 					bundle += ';';
@@ -123,7 +212,7 @@ module.exports = function (grunt) {
 			grunt.file.write(f.dest, grunt.util.normalizelf(fileHeader + bundle + modules + fileFooter));
 		});
 		//Just have one output, so if we making thirty files it only does one line
-		grunt.log.writeln("Successfully converted " + ("" + this.files.length).green +
+		grunt.log.writeln("Successfully converted " + ("" + counter).green +
 						  " html templates to " + options.target + ".");
 	});
 };
